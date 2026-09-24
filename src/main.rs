@@ -21,6 +21,10 @@
 //! middleware: it consults the control plane at `middleware.control_url`
 //! and calls the service directly. Without the section the gateway serves the
 //! upstream directly.
+//!
+//! With a `receipt_log` section, the SHA-256 of every signed receipt is posted
+//! to `receipt_log.url` (for example a service that anchors receipt batches on
+//! chain), and SIGTERM flushes the digests still queued before the process exits.
 
 use std::io::Cursor;
 use std::path::{Path, PathBuf};
@@ -34,7 +38,8 @@ use private_ai_gateway::aci::upstream::{
 };
 use private_ai_gateway::aci::verifier::DEFAULT_VERIFIER_REQUEST_TIMEOUT_SECONDS;
 use private_ai_gateway::aggregator::service::{
-    AciService, AciServiceConfig, Clock, InMemoryReceiptStore, SystemClock, UpstreamVerifier,
+    AciService, AciServiceConfig, Clock, InMemoryReceiptStore, LoggingReceiptStore, ReceiptLog,
+    ReceiptLogConfig, ReceiptStore, SystemClock, UpstreamVerifier,
     DEFAULT_KEYSET_NOT_AFTER_SECONDS,
 };
 use private_ai_gateway::aggregator::session_store::JsonlSessionStore;
@@ -88,6 +93,8 @@ struct GatewayConfigFile {
     enable_e2ee: bool,
     dstack_endpoint: Option<String>,
     middleware: Option<MiddlewareConfig>,
+    /// Post each signed receipt's digest to an external log.
+    receipt_log: Option<ReceiptLogConfig>,
 }
 
 impl Default for GatewayConfigFile {
@@ -105,6 +112,7 @@ impl Default for GatewayConfigFile {
             enable_e2ee: true,
             dstack_endpoint: None,
             middleware: None,
+            receipt_log: None,
         }
     }
 }
@@ -457,7 +465,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         None => None,
     };
     let upstream = upstream_config.backend();
-    let receipt_store = Arc::new(InMemoryReceiptStore::default());
+    let receipt_log = match &gateway_config.receipt_log {
+        Some(log_config) => {
+            let log = ReceiptLog::new(log_config).map_err(invalid_input)?;
+            log.spawn(log_config);
+            spawn_receipt_log_flush_on_sigterm(Arc::clone(&log))?;
+            tracing::info!(url = %log_config.url, "receipt digest log enabled");
+            Some(log)
+        }
+        None => None,
+    };
+    let receipt_store: Arc<dyn ReceiptStore> = match receipt_log {
+        Some(log) => Arc::new(LoggingReceiptStore::new(
+            InMemoryReceiptStore::default(),
+            log,
+        )),
+        None => Arc::new(InMemoryReceiptStore::default()),
+    };
     let upstream_verifier: Arc<dyn UpstreamVerifier> = upstream_config.verifier();
 
     // Keyset lifetime (§3.4): launch time plus a configurable duration. The
@@ -588,6 +612,29 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing::info!(%bind, "private-ai-gateway listening");
     let listener = tokio::net::TcpListener::bind(&bind).await?;
     private_ai_gateway::http::app::serve_with_write_idle_timeout(listener, app).await?;
+    Ok(())
+}
+
+/// On SIGTERM, send the receipt digests still queued (for at most five seconds),
+/// then exit. Without this, a restart would drop digests of receipts already
+/// served.
+fn spawn_receipt_log_flush_on_sigterm(log: Arc<ReceiptLog>) -> std::io::Result<()> {
+    let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+    tokio::spawn(async move {
+        term.recv().await;
+        let pending = log.pending();
+        match tokio::time::timeout(Duration::from_secs(5), log.flush()).await {
+            Ok(Ok(())) => tracing::info!(sent = pending, "SIGTERM: receipt log flushed"),
+            Ok(Err(err)) => {
+                tracing::error!(error = %err, pending = log.pending(), "SIGTERM: receipt log flush failed")
+            }
+            Err(_) => tracing::error!(
+                pending = log.pending(),
+                "SIGTERM: receipt log flush timed out"
+            ),
+        }
+        std::process::exit(0);
+    });
     Ok(())
 }
 
@@ -942,6 +989,30 @@ kBH1U3IsAJyU8UbZqzFEUGG7Ro3vdOQ=
         assert_eq!(middleware.control_token.as_deref(), Some("secret"));
         // Optional timeouts default to None and fall back inside the client.
         assert_eq!(middleware.control_timeout_ms, None);
+        assert!(config.receipt_log.is_none());
+        let _ = std::fs::remove_file(config_path);
+    }
+
+    #[test]
+    fn gateway_config_parses_receipt_log_section() {
+        let config_path = temp_path("gateway-config-receipt-log");
+        std::fs::write(
+            &config_path,
+            r#"{ "receipt_log": { "url": "http://control:8787/receipts", "bearer_token": "secret" } }"#,
+        )
+        .unwrap();
+        let config = load_gateway_config(config_path.to_str().unwrap()).unwrap();
+        let log = config.receipt_log.expect("receipt_log section must parse");
+        assert_eq!(log.url, "http://control:8787/receipts");
+        assert_eq!(log.bearer_token.as_deref(), Some("secret"));
+        assert_eq!(log.flush_interval_ms, None);
+
+        std::fs::write(
+            &config_path,
+            r#"{ "receipt_log": { "url": "http://x", "extra": 1 } }"#,
+        )
+        .unwrap();
+        assert!(load_gateway_config(config_path.to_str().unwrap()).is_err());
         let _ = std::fs::remove_file(config_path);
     }
 

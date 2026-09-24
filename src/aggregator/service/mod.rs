@@ -42,6 +42,7 @@ mod errors;
 mod forward;
 mod helpers;
 mod middleware;
+mod receipt_log;
 mod receipt_store;
 mod receipts;
 mod streaming;
@@ -52,6 +53,9 @@ pub use config::{
     validate_source_provenance, AciServiceConfig, ReceiptOwner, DEFAULT_KEYSET_NOT_AFTER_SECONDS,
 };
 pub use errors::{E2eeError, ServiceError, UpstreamVerificationError};
+pub use receipt_log::{
+    receipt_digest, LoggedReceipt, LoggingReceiptStore, ReceiptLog, ReceiptLogConfig,
+};
 pub use receipt_store::{InMemoryReceiptStore, ReceiptStore};
 pub use wire::{
     ChatCompletionRequest, E2eePreparedRequest, E2eeRequestContext, E2eeRequestParts,
