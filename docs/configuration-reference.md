@@ -53,6 +53,7 @@ This is the smallest practical container config.
 | `dstack_endpoint` | dstack SDK default | dstack SDK endpoint, such as `unix:/var/run/dstack.sock`. |
 | `enable_e2ee` | `true` | Advertise and terminate the [E2EE v2 compatibility extension](../spec/e2ee-v2.md). Set to `false` only for an explicit TLS-only deployment; the attestation then reports `supported_e2ee_versions: []` and v2 requests fail with `e2ee_invalid_version`. |
 | `middleware` | unset | Optional middleware section. When present, the gateway consults a control plane to route and authorize each request and applies request/response transforms; when unset it serves directly. See [Middleware](#middleware). |
+| `receipt_log` | unset | Optional. Posts the digest of every signed receipt to an external append-only log, for example a service that anchors receipt batches on chain. See [Receipt Log](#receipt-log). |
 
 ## Upstream Pull
 
@@ -131,6 +132,39 @@ travel in.
 ```
 
 Only `control_url` is required.
+
+## Receipt Log
+
+The optional `receipt_log` section forwards the digest of every signed receipt,
+successful or not, to an external log. The digest is the SHA-256 of the
+receipt's JCS bytes with `signature` included, which are the bytes the gateway
+serves, so it equals what any verifier computes from a fetched receipt. Only the
+receipt id and the digest leave the gateway.
+
+Digests queue in memory and are posted in order as
+`POST <url>` with body `{"receipts":[{"receiptId":"rcpt-…","digest":"0x<64 hex>"}]}`.
+The log must answer 2xx once the batch is durable and must ignore a digest it
+already holds: delivery is at least once, and a failed batch is retried with
+backoff (up to a minute) before anything behind it. On SIGTERM the gateway sends
+what is still queued, for at most five seconds, then exits. A digest queued when
+the process dies without SIGTERM is lost.
+
+| Field | Default | Meaning |
+| --- | --- | --- |
+| `receipt_log.url` | required | `http`/`https` endpoint of the log. |
+| `receipt_log.bearer_token` | unset | Bearer token sent to the log. |
+| `receipt_log.flush_interval_ms` | `200` | How often queued digests are sent. |
+| `receipt_log.max_batch` | `500` | Digests per request. |
+| `receipt_log.max_queue` | `1000000` | Digests held while the log is unreachable. Beyond this, new digests are dropped and logged as errors. |
+
+```json
+{
+  "receipt_log": {
+    "url": "http://control:8787/receipts",
+    "bearer_token": "<log-bearer-token>"
+  }
+}
+```
 
 ## Source Provenance
 
