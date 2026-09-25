@@ -6,7 +6,9 @@ use bytes::Bytes;
 use futures_util::Stream;
 
 use super::{ReceiptOwner, ServiceError};
-use crate::aci::receipt::{ReceiptBuilder, SignedReceipt, UpstreamVerifiedEvent};
+use crate::aci::receipt::{
+    ReceiptBuilder, ReceiptError, SignedReceipt, UpstreamVerifiedEvent, EVENT_BILLING_CHARGED,
+};
 use crate::aggregator::metrics::RequestMode;
 
 pub struct E2eeRequestParts<'a> {
@@ -162,6 +164,22 @@ pub struct MiddlewareReceiptDraft {
     pub(super) response_model: Option<String>,
 }
 
+impl MiddlewareReceiptDraft {
+    pub fn receipt_id(&self) -> &str {
+        &self.receipt_id
+    }
+
+    /// Record what the request was billed (`billing.charged`), before the
+    /// response is recorded and the receipt is signed.
+    pub fn add_billing(
+        &mut self,
+        fields: serde_json::Map<String, serde_json::Value>,
+    ) -> Result<(), ReceiptError> {
+        self.builder
+            .add_extension_event(EVENT_BILLING_CHARGED, fields)
+    }
+}
+
 /// The candidate whose upstream response the forwarder is waiting for.
 ///
 /// Published so a request abandoned while that wait is in progress — the
@@ -191,9 +209,27 @@ struct MiddlewareReceiptJournalState {
     /// them. Never read on a completed request (the forward result carries
     /// the authoritative list).
     abandoned: Vec<FailedAttempt>,
+    /// The `billing.charged` fields, set by the stream meter once it has priced
+    /// the final usage, and written into the receipt by the finalizer.
+    billing: Option<serde_json::Map<String, serde_json::Value>>,
 }
 
 impl MiddlewareReceiptJournal {
+    pub fn set_billing(&self, fields: serde_json::Map<String, serde_json::Value>) {
+        self.inner
+            .lock()
+            .expect("middleware receipt journal poisoned")
+            .billing = Some(fields);
+    }
+
+    pub fn take_billing(&self) -> Option<serde_json::Map<String, serde_json::Value>> {
+        self.inner
+            .lock()
+            .expect("middleware receipt journal poisoned")
+            .billing
+            .take()
+    }
+
     pub fn set_in_flight(&self, route_id: &str, attempt_index: u32) {
         self.inner
             .lock()

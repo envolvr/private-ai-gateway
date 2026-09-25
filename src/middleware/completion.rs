@@ -38,7 +38,7 @@ use super::request_transform::{
     build_candidates, responses_to_chat_params, validate_responses_request, Endpoint,
     ResponsesCandidateInput, TransformError,
 };
-use super::sse::{KeepAliveStream, MeterStream, StreamReport};
+use super::sse::{BillingSink, KeepAliveStream, MeterStream, StreamReport};
 use super::stream_transform::{SseTransformStream, StreamTransform, UpstreamUsage};
 use super::types::{
     ErrorClass, ErrorSource, PostReport, ProviderFormat, RouteCandidate, SpendMode, TenantIdentity,
@@ -480,6 +480,12 @@ pub async fn run(
                 client_endpoint
             };
 
+            // What the receipt records as billed, when the response is priced.
+            let payer = requester.as_ref().map(|r| {
+                pricing::payer_commitment(&r.auth_token_sha256, forward.receipt.receipt_id())
+            });
+            let mut billing: Option<serde_json::Map<String, Value>> = None;
+
             // The buffered forward commits the candidate even on non-2xx; a
             // non-2xx body is normalized rather than transformed, but the receipt
             // is finalized either way.
@@ -532,6 +538,11 @@ pub async fn run(
                         .or_else(|| transformed.get("usage").cloned())
                     {
                         let cost = pricing::compute_cost(&usage, pricing_config);
+                        billing = Some(pricing::billing_fields(
+                            &usage,
+                            pricing_config,
+                            payer.as_deref(),
+                        ));
                         if let Some(usage_obj) =
                             transformed.get_mut("usage").and_then(Value::as_object_mut)
                         {
@@ -593,8 +604,14 @@ pub async fn run(
                 (mapped, body)
             };
 
+            let mut draft = forward.receipt;
+            if let Some(fields) = billing {
+                if let Err(err) = draft.add_billing(fields) {
+                    return service_error_response(outcome_ctx, err.into(), None);
+                }
+            }
             match service.finalize_middleware_receipt(
-                forward.receipt,
+                draft,
                 &final_body,
                 Some("application/json"),
                 requester.clone(),
@@ -660,13 +677,14 @@ pub async fn run(
                 ..meter.base()
             };
             let late_failure_control = control.clone();
-            let report = meter.into_stream_report(
+            let mut report = meter.into_stream_report(
                 forward.selected_route.clone(),
                 attempt_index,
                 upstream_status,
                 downstream_abort.clone(),
                 meter_settled.clone(),
             );
+            report.billing = billing_sink(&journal, requester.as_ref());
             // Order: provider stream (drafts response.received) -> format
             // transform (if cross-format) -> response visibility -> sanitize
             // -> meter/cost -> keep-alive -> finalizer (hashes response.returned).
@@ -1035,6 +1053,8 @@ fn build_early_streaming_response(
     let stream_request_id = request_id.clone();
     let stream_abort = downstream_abort.clone();
     let stream_settled = meter_settled.clone();
+    let sink_journal = journal.clone();
+    let sink_requester = requester.clone();
     let body_stream = async_stream::stream! {
         // Committed after the interval already elapsed: give the client a byte
         // immediately so the 200 does not read as an empty hang.
@@ -1045,13 +1065,15 @@ fn build_early_streaming_response(
                 meter.failed_attempts(&f.failed_attempts, true);
                 let upstream_status = f.upstream_status;
                 let selected_route = f.selected_route.clone();
-                let report = meter.into_stream_report(
+                let mut report = meter.into_stream_report(
                     selected_route.clone(),
                     attempt_index,
                     upstream_status,
                     stream_abort.clone(),
                     stream_settled.clone(),
                 );
+                // The receipt id is reserved once the forward has committed.
+                report.billing = billing_sink(&sink_journal, sink_requester.as_ref());
                 let mut pipeline = build_metered_pipeline(
                     f.body,
                     &selected_route,
@@ -1164,6 +1186,18 @@ pub(super) struct StreamPipelineInputs {
 /// stream: the format/visibility/sanitize transforms, then the meter. The meter
 /// sits innermost so it only ever parses real upstream SSE bytes; the caller
 /// layers the keep-alive and finalizer outside it.
+/// The stream meter's way into the receipt, once the request has a receipt id.
+fn billing_sink(
+    journal: &MiddlewareReceiptJournal,
+    requester: Option<&ReceiptOwner>,
+) -> Option<BillingSink> {
+    let receipt_id = journal.peek_receipt_id()?;
+    Some(BillingSink {
+        journal: journal.clone(),
+        payer: requester.map(|r| pricing::payer_commitment(&r.auth_token_sha256, &receipt_id)),
+    })
+}
+
 pub(super) fn build_metered_pipeline(
     body: ServiceResponseStream,
     selected_route: &str,
@@ -1279,6 +1313,7 @@ impl Meter {
             started: self.started,
             downstream_abort,
             settled,
+            billing: None,
         }
     }
 
