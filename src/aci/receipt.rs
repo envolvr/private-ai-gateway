@@ -25,6 +25,9 @@ pub const EVENT_RESPONSE_RETURNED: &str = "response.returned";
 // types). They record routing decisions and the upstream's response bytes.
 pub const EVENT_MIDDLEWARE_FORWARDED: &str = "middleware.forwarded";
 pub const EVENT_ROUTE_SELECTED: &str = "route.selected";
+/// Extension event (middleware): what the request was billed, priced by the
+/// gateway from the reported usage and the admitted pricing.
+pub const EVENT_BILLING_CHARGED: &str = "billing.charged";
 pub const EVENT_RESPONSE_RECEIVED: &str = "response.received";
 
 #[derive(Debug, thiserror::Error)]

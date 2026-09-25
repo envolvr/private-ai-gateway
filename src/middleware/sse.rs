@@ -102,6 +102,14 @@ impl StreamFailure {
 }
 
 /// Fixed fields for the post-stream usage report; `settle` fills in the rest.
+/// Where a stream's priced usage goes: the request's receipt journal, and the
+/// payer commitment computed when the request was admitted.
+#[derive(Clone)]
+pub struct BillingSink {
+    pub journal: crate::aggregator::service::MiddlewareReceiptJournal,
+    pub payer: Option<String>,
+}
+
 pub struct StreamReport {
     pub control: ControlClient,
     pub request_id: String,
@@ -127,6 +135,9 @@ pub struct StreamReport {
     /// meter has already settled Completed and will not emit again) so it can
     /// record the failure itself.
     pub settled: Arc<AtomicBool>,
+    /// When set, the cost priced from the final usage is also recorded in the
+    /// receipt (`billing.charged`).
+    pub billing: Option<BillingSink>,
 }
 
 impl StreamReport {
@@ -495,10 +506,15 @@ impl MeterStream {
                         let upstream_usage = self.upstream_usage.as_ref().and_then(|slot| {
                             slot.lock().unwrap_or_else(PoisonError::into_inner).clone()
                         });
-                        let cost = pricing::compute_cost(
-                            upstream_usage.as_ref().unwrap_or(&billed),
-                            pricing,
-                        );
+                        let priced_usage = upstream_usage.as_ref().unwrap_or(&billed);
+                        let cost = pricing::compute_cost(priced_usage, pricing);
+                        if let Some(sink) = &self.report.billing {
+                            sink.journal.set_billing(pricing::billing_fields(
+                                priced_usage,
+                                pricing,
+                                sink.payer.as_deref(),
+                            ));
+                        }
                         if let Some(usage_map) = usage_obj.as_object_mut() {
                             usage_map.insert("cost".to_string(), pricing::cost_to_json(cost));
                         }
@@ -885,6 +901,7 @@ mod tests {
             started: Instant::now(),
             downstream_abort: Arc::new(AtomicBool::new(false)),
             settled: Arc::new(AtomicBool::new(false)),
+            billing: None,
         };
         let inner: ServiceResponseStream = Box::pin(futures_util::stream::empty());
         MeterStream::new(inner, report, protocol)

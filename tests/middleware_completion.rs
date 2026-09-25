@@ -1810,6 +1810,7 @@ async fn meter_stream_injects_cost_classifies_completed_and_reports() {
         started: std::time::Instant::now(),
         downstream_abort: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         settled: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        billing: None,
     };
     let events: Vec<Result<Bytes, _>> = vec![
         Ok(Bytes::from(
@@ -2486,6 +2487,7 @@ async fn downstream_abort_before_settle_reports_gateway_failure_not_client_close
         started: std::time::Instant::now(),
         downstream_abort: downstream_abort.clone(),
         settled: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        billing: None,
     };
     // One chunk, then the stream stays open: the meter starts but never
     // reaches a terminal marker.
@@ -2553,6 +2555,7 @@ async fn downstream_abort_after_settle_does_not_double_report() {
         started: std::time::Instant::now(),
         downstream_abort: downstream_abort.clone(),
         settled: settled.clone(),
+        billing: None,
     };
     let events: Vec<Result<Bytes, private_ai_gateway::aggregator::service::ServiceError>> =
         vec![Ok(Bytes::from(
@@ -3300,6 +3303,7 @@ async fn mid_stream_read_timeout_settles_504_as_upstream_timeout() {
         started: std::time::Instant::now(),
         downstream_abort: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         settled: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        billing: None,
     };
     let events: Vec<Result<Bytes, ServiceError>> = vec![
         Ok(Bytes::from(
@@ -3494,6 +3498,7 @@ async fn unpolled_drop_is_a_client_disconnect_unless_the_pipeline_marked_itself(
         started: std::time::Instant::now(),
         downstream_abort: abort.clone(),
         settled: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        billing: None,
     };
     let pending = || -> ServiceResponseStream { Box::pin(futures_util::stream::pending()) };
 
@@ -3851,6 +3856,7 @@ async fn in_band_stream_error_settles_with_a_class_and_none_of_its_text() {
         started: std::time::Instant::now(),
         downstream_abort: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         settled: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        billing: None,
     };
     let events: Vec<Result<Bytes, ServiceError>> = vec![Ok(Bytes::from(format!(
         "data: {{\"error\":{{\"message\":\"{CANARY} quoted prompt text\"}}}}\n\ndata: [DONE]\n\n",
@@ -3864,4 +3870,143 @@ async fn in_band_stream_error_settles_with_a_class_and_none_of_its_text() {
     assert_eq!(report["status"], json!(502));
     assert_eq!(report["errorMessage"], json!("stream_inband_error"));
     assert_canary_absent(&posts, "probe-canary-inband");
+}
+
+/// The receipt's `billing.charged` event, and everything before it in order.
+fn billing_event(service: &AciService, receipt_id: &str) -> (Value, Vec<String>) {
+    let receipt = service
+        .get_receipt_by_receipt_id(receipt_id)
+        .expect("the receipt must be stored");
+    let log = receipt.document_json().unwrap()["event_log"]
+        .as_array()
+        .unwrap()
+        .clone();
+    let types: Vec<String> = log
+        .iter()
+        .map(|e| e["type"].as_str().unwrap().to_string())
+        .collect();
+    let billing = log
+        .into_iter()
+        .find(|e| e["type"] == "billing.charged")
+        .expect("the receipt records billing.charged");
+    (billing, types)
+}
+
+#[tokio::test]
+async fn receipts_record_what_was_billed_buffered_and_streamed() {
+    use private_ai_gateway::aggregator::service::ReceiptOwner;
+    use private_ai_gateway::middleware::pricing::payer_commitment;
+    let pricing = json!({ "inputCostPerToken": "0.000001", "outputCostPerToken": "0.000002" });
+    let control_url = spawn_control(
+        200,
+        json!({
+            "allow": true,
+            "candidates": [{ "routeId": "compatible:gpt-test", "format": "openai" }],
+            "pricing": pricing,
+        }),
+    )
+    .await;
+    let owner = ReceiptOwner::from_bearer("envk_test-key");
+
+    // Buffered: the event carries the cost shown to the client, the rates and
+    // token counts it follows from, and the payer commitment; it precedes
+    // response.returned.
+    let body = json!({
+        "id": "chatcmpl-1", "object": "chat.completion", "model": "gpt-test",
+        "choices": [{ "index": 0, "message": { "role": "assistant", "content": "hi" }, "finish_reason": "stop" }],
+        "usage": { "prompt_tokens": 100, "completion_tokens": 20, "total_tokens": 120 }
+    });
+    let service = build_service_with_upstream(200, serde_json::to_vec(&body).unwrap());
+    let mut input = chat_input();
+    input.requester = Some(owner.clone());
+    let (status, headers, client) = response_parts(
+        middleware(control_url.clone())
+            .handle_completion(&service, input)
+            .await,
+    )
+    .await;
+    assert_eq!(status, 200, "{client}");
+    let receipt_id = headers["x-receipt-id"].to_str().unwrap().to_string();
+    let (billing, types) = billing_event(&service, &receipt_id);
+    // The exact cost as a decimal string, equal to the cost shown to the client.
+    assert_eq!(billing["cost"], json!("0.00014"));
+    assert!((client["usage"]["cost"].as_f64().unwrap() - 0.00014).abs() < 1e-12);
+    assert_eq!(billing["billed_micro_usd"], json!(140));
+    assert_eq!(billing["currency"], json!("USD"));
+    assert_eq!(billing["rates"], pricing);
+    assert_eq!(
+        billing["tokens"],
+        json!({ "prompt": 100, "completion": 20, "cache_read": 0, "cache_creation": 0 })
+    );
+    assert_eq!(
+        billing["payer"],
+        json!(payer_commitment(&owner.auth_token_sha256, &receipt_id))
+    );
+    let at = types.iter().position(|t| t == "billing.charged").unwrap();
+    assert_eq!(types.last().unwrap(), "response.returned");
+    assert!(at < types.len() - 1);
+
+    // Streamed: the same event, priced from the final usage chunk.
+    let upstream = concat!(
+        "data: {\"id\":\"chatcmpl-2\",\"object\":\"chat.completion.chunk\",\"model\":\"gpt-test\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hi\"},\"finish_reason\":null}]}\n\n",
+        "data: {\"id\":\"chatcmpl-2\",\"object\":\"chat.completion.chunk\",\"model\":\"gpt-test\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":7,\"completion_tokens\":3,\"total_tokens\":10}}\n\n",
+        "data: [DONE]\n\n",
+    );
+    let (service, _requests) =
+        build_recording_service(200, upstream.as_bytes().to_vec(), "text/event-stream");
+    let mut input = chat_input();
+    input.stream = true;
+    input.params["stream"] = json!(true);
+    input.received_body = serde_json::to_vec(&input.params).unwrap();
+    input.requester = Some(owner.clone());
+    let response = middleware(control_url.clone())
+        .handle_completion(&service, input)
+        .await;
+    assert_eq!(response.status(), 200);
+    let (headers, text) = raw_body(response).await;
+    let receipt_id = headers["x-receipt-id"].to_str().unwrap().to_string();
+    let shown = sse_events(&text)
+        .into_iter()
+        .find_map(|e| e["usage"].get("cost").cloned())
+        .expect("the stream shows its cost");
+    let (billing, types) = billing_event(&service, &receipt_id);
+    assert_eq!(billing["cost"], json!("0.000013"));
+    assert!((shown.as_f64().unwrap() - 0.000013).abs() < 1e-12);
+    assert_eq!(billing["billed_micro_usd"], json!(13));
+    assert_eq!(billing["tokens"]["prompt"], json!(7));
+    assert_eq!(
+        billing["payer"],
+        json!(payer_commitment(&owner.auth_token_sha256, &receipt_id))
+    );
+    assert_eq!(types.last().unwrap(), "response.returned");
+}
+
+#[tokio::test]
+async fn without_pricing_the_receipt_records_no_billing() {
+    let control_url = spawn_control(
+        200,
+        json!({ "allow": true, "candidates": [{ "routeId": "compatible:gpt-test", "format": "openai" }] }),
+    )
+    .await;
+    let body = json!({
+        "id": "chatcmpl-3", "object": "chat.completion", "model": "gpt-test",
+        "choices": [{ "index": 0, "message": { "role": "assistant", "content": "hi" }, "finish_reason": "stop" }],
+        "usage": { "prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2 }
+    });
+    let service = build_service_with_upstream(200, serde_json::to_vec(&body).unwrap());
+    let (status, headers, _client) = response_parts(
+        middleware(control_url)
+            .handle_completion(&service, chat_input())
+            .await,
+    )
+    .await;
+    assert_eq!(status, 200);
+    let receipt = service
+        .get_receipt_by_receipt_id(headers["x-receipt-id"].to_str().unwrap())
+        .unwrap();
+    let log = receipt.document_json().unwrap()["event_log"]
+        .as_array()
+        .unwrap()
+        .clone();
+    assert!(log.iter().all(|e| e["type"] != "billing.charged"));
 }

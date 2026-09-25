@@ -105,6 +105,11 @@ fn rate(pricing: &Value, key: &str) -> Option<Decimal> {
 
 /// Compute the request cost from usage and pricing, as an `f64`.
 pub fn compute_cost(usage: &Value, pricing: &Value) -> f64 {
+    cost_decimal(usage, pricing).to_f64().unwrap_or(0.0)
+}
+
+/// The exact cost: every rate and count is a decimal, so nothing is rounded.
+fn cost_decimal(usage: &Value, pricing: &Value) -> Decimal {
     let resolved = resolve_usage(usage);
     let input_rate = rate(pricing, "inputCostPerToken").unwrap_or(Decimal::ZERO);
     let cache_read_rate = rate(pricing, "cacheReadCostPerToken").unwrap_or(input_rate);
@@ -113,11 +118,10 @@ pub fn compute_cost(usage: &Value, pricing: &Value) -> f64 {
 
     let uncached_input = (resolved.prompt - resolved.cache_read - resolved.cache_creation).max(0);
 
-    let cost = Decimal::from(uncached_input) * input_rate
+    Decimal::from(uncached_input) * input_rate
         + Decimal::from(resolved.cache_read) * cache_read_rate
         + Decimal::from(resolved.cache_creation) * cache_creation_rate
-        + Decimal::from(resolved.completion) * output_rate;
-    cost.to_f64().unwrap_or(0.0)
+        + Decimal::from(resolved.completion) * output_rate
 }
 
 /// Serialize an `f64` cost the way JavaScript's `JSON.stringify` would: an
@@ -290,5 +294,134 @@ mod tests {
     fn cost_to_json_matches_js_integer_formatting() {
         assert_eq!(cost_to_json(0.0), json!(0));
         assert_eq!(cost_to_json(0.000135), json!(0.000135));
+    }
+}
+
+/// Commitment to the credential that paid for a request:
+/// `"sha256:" || hex(sha256("billing.payer.v1:" || hex(sha256(api_key)) || ":" || receipt_id))`,
+/// with bare lowercase hex for the key hash (the form the control plane uses).
+/// It names no account, links no two receipts, and cannot be tested without
+/// the key hash; the payer proves it by disclosing that hash. Accepts the key
+/// hash with or without the `sha256:` prefix (`ReceiptOwner` keeps it prefixed).
+pub fn payer_commitment(key_sha256: &str, receipt_id: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let key_hex = key_sha256.strip_prefix("sha256:").unwrap_or(key_sha256);
+    let digest = Sha256::digest(format!("billing.payer.v1:{key_hex}:{receipt_id}").as_bytes());
+    format!("sha256:{}", hex::encode(digest))
+}
+
+/// Fields of the receipt's `billing.charged` event: the token counts priced,
+/// the per-token rates applied, the exact cost that follows from them (a
+/// decimal string: ACI documents carry no fractional numbers), the amount
+/// billed (that cost rounded up to the next micro-USD), and the payer
+/// commitment when the request carried a credential.
+pub fn billing_fields(
+    usage: &Value,
+    pricing: &Value,
+    payer: Option<&str>,
+) -> serde_json::Map<String, Value> {
+    let resolved = resolve_usage(usage);
+    let cost = cost_decimal(usage, pricing);
+    let billed = (cost * Decimal::from(1_000_000))
+        .ceil()
+        .to_i64()
+        .unwrap_or(0);
+    let mut rates = serde_json::Map::new();
+    for key in [
+        "inputCostPerToken",
+        "outputCostPerToken",
+        "cacheReadCostPerToken",
+        "cacheCreationCostPerToken",
+    ] {
+        if let Some(value) = pricing.get(key).filter(|v| !v.is_null()) {
+            rates.insert(key.to_string(), value.clone());
+        }
+    }
+    let mut fields = serde_json::Map::new();
+    fields.insert("currency".to_string(), Value::from("USD"));
+    fields.insert(
+        "cost".to_string(),
+        Value::from(cost.normalize().to_string()),
+    );
+    fields.insert("billed_micro_usd".to_string(), Value::from(billed));
+    fields.insert("rates".to_string(), Value::Object(rates));
+    fields.insert(
+        "tokens".to_string(),
+        serde_json::json!({
+            "prompt": resolved.prompt,
+            "completion": resolved.completion,
+            "cache_read": resolved.cache_read,
+            "cache_creation": resolved.cache_creation,
+        }),
+    );
+    if let Some(payer) = payer {
+        fields.insert("payer".to_string(), Value::from(payer));
+    }
+    fields
+}
+
+#[cfg(test)]
+mod billing_tests {
+    use super::{billing_fields, payer_commitment};
+    use serde_json::json;
+
+    #[test]
+    fn payer_commitment_matches_the_cross_implementation_vector() {
+        // API key "envk_test-key", receipt "rcpt-1"; the same vector is pinned in
+        // the SDK (sdk/test) and was computed independently with Python hashlib.
+        let key_hash = "048ef72fe636a376d63ba018b8c4b9a302ff0758a1875dee4d87c0994db37230";
+        let expected = "sha256:cdae03a3662f631fabeb55bdc1c61bd1a2df2e4799d05cffc410f27ed7ca578e";
+        assert_eq!(payer_commitment(key_hash, "rcpt-1"), expected);
+        assert_eq!(
+            payer_commitment(&format!("sha256:{key_hash}"), "rcpt-1"),
+            expected
+        );
+        assert_eq!(
+            crate::aggregator::service::ReceiptOwner::from_bearer("envk_test-key")
+                .auth_token_sha256,
+            format!("sha256:{key_hash}")
+        );
+        assert_ne!(
+            payer_commitment(key_hash, "rcpt-2"),
+            expected,
+            "receipts are not linkable"
+        );
+    }
+
+    #[test]
+    fn billing_fields_carry_rates_tokens_cost_and_payer() {
+        let usage = json!({ "prompt_tokens": 10, "completion_tokens": 5, "prompt_tokens_details": { "cached_tokens": 4 } });
+        let pricing = json!({ "inputCostPerToken": "0.000001", "outputCostPerToken": "0.000002", "cacheReadCostPerToken": null });
+        // 6 uncached input + 4 cached (at the input rate) + 5 output:
+        // 10 * 0.000001 + 5 * 0.000002 = 0.00002, billed as 20 micro-USD.
+        let fields = billing_fields(&usage, &pricing, Some("sha256:00"));
+        assert_eq!(
+            json!(fields),
+            json!({
+                "currency": "USD",
+                "cost": "0.00002",
+                "billed_micro_usd": 20,
+                "rates": { "inputCostPerToken": "0.000001", "outputCostPerToken": "0.000002" },
+                "tokens": { "prompt": 10, "completion": 5, "cache_read": 4, "cache_creation": 0 },
+                "payer": "sha256:00",
+            })
+        );
+        assert!(billing_fields(&usage, &pricing, None)
+            .get("payer")
+            .is_none());
+        // A fraction of a micro-USD is billed as a whole one, as the control plane does.
+        let tiny = billing_fields(
+            &json!({ "prompt_tokens": 1, "completion_tokens": 0 }),
+            &pricing,
+            None,
+        );
+        assert_eq!(tiny["cost"], json!("0.000001"));
+        assert_eq!(tiny["billed_micro_usd"], json!(1));
+        let fraction = billing_fields(
+            &json!({ "prompt_tokens": 1, "completion_tokens": 0 }),
+            &json!({ "inputCostPerToken": "0.0000014" }),
+            None,
+        );
+        assert_eq!(fraction["billed_micro_usd"], json!(2));
     }
 }

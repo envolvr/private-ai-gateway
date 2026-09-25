@@ -440,6 +440,9 @@ impl FinalizingStream for MiddlewareResponseFinalizingStream {
         if self.shared.sse_parser.chat_id().is_some() {
             draft.builder.set_chat_id(self.shared.sse_parser.chat_id());
         }
+        if let Some(billing) = self.journal.take_billing() {
+            draft.add_billing(billing)?;
+        }
         draft
             .builder
             .add_response_returned_hash(self.shared.wire_hash())?;
