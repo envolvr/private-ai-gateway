@@ -53,14 +53,24 @@ decrypts the response. A response that decrypts proves the bound enclave served 
 
 ## Notes
 
-- Cold evidence verification is slow (~138 s); it runs off the request path via the
+- Cold evidence verification takes 20–100 s; it runs off the request path via the
   verification lease + a pooled nonce session. See the lifecycle doc.
-- `/e2e/instances` is aggressively rate-limited; the default
-  `chutes_e2ee_discovery_rounds: 3` can self-trigger a `429` on a cold chute.
-  `rounds: 1` is gentler.
-- NVIDIA NRAS tokens are fetched online over TLS and nonce-checked; the JWT signature
-  itself is not additionally verified against NRAS' JWKS (tracked defense-in-depth
-  follow-up in the roadmap).
+- Evidence (`/chutes/{id}/evidence`) is rate-limited per account: measured
+  2026-09-30, about three calls, then `429` on every chute for 30–45 s. The bridge
+  waits out a `429` (honouring `Retry-After`, up to half its timeout) instead of
+  failing the verification.
+- `/e2e/instances` returns five random instances per call and tolerated ten calls
+  in twenty seconds. One evidence call covers every instance, so more discovery
+  rounds verify more of a fleet at the same evidence cost:
+  `chutes_e2ee_discovery_rounds: 8` with a 2 s interval verified about 30 of 65
+  instances of a large chute.
+- When discovery returns only unverified instances, the backend asks again (up to
+  four calls) before treating it as a binding mismatch, which would re-verify and
+  spend evidence budget.
+- An instance that fails before answering (connection error or 500/502/503/504)
+  gets one retry on the next verified instance.
+- NVIDIA NRAS tokens are nonce-checked and their ES384 signature is verified
+  against NRAS' published JWKS, with the issuer checked.
 
 ## Reproduce
 

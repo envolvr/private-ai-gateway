@@ -89,6 +89,27 @@ def chutes_debug_enabled(quote_bytes: bytes) -> bool:
     return tdx_debug_enabled(quote_bytes)
 
 
+def chutes_get(requests: Any, url: str, *, deadline: float, **kwargs: Any) -> Any:
+    """GET a Chutes API URL, waiting out 429s until `deadline` (monotonic).
+
+    Chutes rate-limits evidence per account (a few calls, then 429 for tens of
+    seconds). Waiting keeps a verification alive through a burst instead of
+    failing it and prompting another fetch.
+    """
+    wait = 15.0
+    while True:
+        response = requests.get(url, **kwargs)
+        if response.status_code != 429:
+            response.raise_for_status()
+            return response
+        retry_after = (response.headers.get("retry-after") or "").strip()
+        delay = float(retry_after) if retry_after.isdigit() else wait
+        if time.monotonic() + delay > deadline:
+            response.raise_for_status()
+        time.sleep(delay)
+        wait = min(wait * 2, 60.0)
+
+
 def chutes_discovery_rounds(options: dict[str, str]) -> int:
     value = options.get("chutes_e2ee_discovery_rounds", "3")
     try:
@@ -132,6 +153,10 @@ def chutes_measurement_name(
         if all(str(expected.get(k) or "").lower() == v for k, v in rtmrs.items()):
             return str(profile.get("name") or "unnamed")
     return None
+
+
+NRAS_ISSUER = "https://nras.attestation.nvidia.com"
+NRAS_JWKS_URL = f"{NRAS_ISSUER}/.well-known/jwks.json"
 
 
 def chutes_verify_gpu(
@@ -189,10 +214,17 @@ def chutes_verify_gpu(
         platform = tokens[0]
         if not isinstance(platform, list) or len(platform) < 2 or platform[0] != "JWT":
             return result
+        # Verify the token against NVIDIA's published signing keys: the claim
+        # must not rest on the TLS connection alone.
+        signing_key = jwt.PyJWKClient(
+            NRAS_JWKS_URL, timeout=timeout
+        ).get_signing_key_from_jwt(platform[1])
         claims = jwt.decode(
             platform[1],
-            options={"verify_signature": False},
-            algorithms=["RS256", "ES256", "ES384", "PS256"],
+            signing_key.key,
+            algorithms=["ES384"],
+            issuer=NRAS_ISSUER,
+            options={"verify_aud": False},
         )
         nonce_matched = claims.get("eat_nonce") == expected_report_data
         result["gpu_evidence_nonce_matched"] = nonce_matched
@@ -283,6 +315,9 @@ async def verify_chutes(request: dict[str, Any]) -> None:
     import requests
 
     timeout = request_timeout_seconds(request, 60)
+    # Rate-limit waits may use up to half the budget; the rest is for DCAP
+    # collateral and NVIDIA's attestation service.
+    deadline = time.monotonic() + timeout / 2
     headers = chutes_headers(api_key, basic_auth)
     chute_id = chutes_resolve_id(
         request["model_id"],
@@ -309,13 +344,14 @@ async def verify_chutes(request: dict[str, Any]) -> None:
     ]
 
     nonce = secrets.token_hex(32)
-    evidence_response = requests.get(
+    evidence_response = chutes_get(
+        requests,
         attestation_url,
+        deadline=deadline,
         params={"nonce": nonce},
         headers=headers,
         timeout=timeout,
     )
-    evidence_response.raise_for_status()
     evidence_body = evidence_response.content
     evidence_data = json.loads(evidence_body.decode("utf-8"))
     evidence_items = evidence_data.get("evidence") or []
@@ -336,12 +372,13 @@ async def verify_chutes(request: dict[str, Any]) -> None:
     for round_index in range(discovery_rounds):
         if round_index > 0 and discovery_interval > 0:
             time.sleep(discovery_interval)
-        pubkeys_response = requests.get(
+        pubkeys_response = chutes_get(
+            requests,
             f"{api_base}/e2e/instances/{chute_id}",
+            deadline=deadline,
             headers=headers,
             timeout=timeout,
         )
-        pubkeys_response.raise_for_status()
         pubkeys_body = pubkeys_response.content
         pubkeys_data = json.loads(pubkeys_body.decode("utf-8"))
         pubkeys_responses.append(pubkeys_data)

@@ -37,6 +37,14 @@ const CHUTES_INFO_RESP: &[u8] = b"e2e-resp-v1";
 const CHUTES_INFO_STREAM: &[u8] = b"e2e-stream-v1";
 const CHUTES_MODEL_CACHE_TTL_SECONDS: u64 = 300;
 const CHUTES_DEFAULT_NONCE_TTL_SECONDS: u64 = 55;
+/// Discovery returns a few instances of a chute's fleet at a time, so one call
+/// can miss every verified instance. Discovery is cheap; a re-verification
+/// fetches evidence, which Chutes rate-limits per account. Ask again first.
+const CHUTES_DISCOVERY_ATTEMPTS: usize = 4;
+/// Instances are independent miner machines. One that fails before answering
+/// (connection error or 500/502/503/504) gets one retry on the next verified
+/// instance; the receipt names the instance that served.
+const CHUTES_INVOKE_ATTEMPTS: usize = 2;
 
 /// Chutes provider adapter.
 ///
@@ -166,36 +174,50 @@ impl ChutesProviderBackend {
             })?;
         let chute_id = self.resolve_chute_id(model, &api_key).await?;
         let accepted = chutes_accepted_bindings(event)?;
-        let selected = self
-            .acquire_verified_chutes_session(&chute_id, &api_key, &accepted)
-            .await?;
-        let encrypted = build_chutes_e2ee_request(&selected.e2e_pubkey, payload)?;
-        let headers = chutes_invoke_headers(
-            &self.authorization(&api_key),
-            &chute_id,
-            &selected.instance_id,
-            &selected.nonce,
-            stream,
-            req.request
-                .path
-                .as_deref()
-                .unwrap_or("/v1/chat/completions"),
-        );
-        let url = format!("{}/e2e/invoke", self.e2ee_api_base);
-        let mut builder = self.client.post(url).body(encrypted.blob);
-        for (name, value) in headers {
-            builder = builder.header(name, value);
+        let path = req
+            .request
+            .path
+            .as_deref()
+            .unwrap_or("/v1/chat/completions");
+        let mut attempt = 0;
+        loop {
+            attempt += 1;
+            let retry_allowed = attempt < CHUTES_INVOKE_ATTEMPTS;
+            let selected = self
+                .acquire_verified_chutes_session(&chute_id, &api_key, &accepted)
+                .await?;
+            let encrypted = build_chutes_e2ee_request(&selected.e2e_pubkey, payload.clone())?;
+            let headers = chutes_invoke_headers(
+                &self.authorization(&api_key),
+                &chute_id,
+                &selected.instance_id,
+                &selected.nonce,
+                stream,
+                path,
+            );
+            let url = format!("{}/e2e/invoke", self.e2ee_api_base);
+            let mut builder = self.client.post(url).body(encrypted.blob);
+            for (name, value) in headers {
+                builder = builder.header(name, value);
+            }
+            let resp = match builder.send().await {
+                Ok(resp) => resp,
+                Err(_) if retry_allowed => continue,
+                Err(err) => return Err(transport_error(err)),
+            };
+            let status_code = resp.status().as_u16();
+            if retry_allowed && matches!(status_code, 500 | 502 | 503 | 504) {
+                continue;
+            }
+            let headers = response_headers(&resp);
+            return Ok(ChutesInvokeResponse {
+                status_code,
+                headers,
+                response_sk: encrypted.response_sk,
+                response: resp,
+                instance_id: selected.instance_id,
+            });
         }
-        let resp = builder.send().await.map_err(transport_error)?;
-        let status_code = resp.status().as_u16();
-        let headers = response_headers(&resp);
-        Ok(ChutesInvokeResponse {
-            status_code,
-            headers,
-            response_sk: encrypted.response_sk,
-            response: resp,
-            instance_id: selected.instance_id,
-        })
     }
 
     async fn resolve_chute_id(&self, model: &str, api_key: &str) -> Result<String, UpstreamError> {
@@ -275,14 +297,38 @@ impl ChutesProviderBackend {
         if let Some(selected) = self.pop_verified_chutes_nonce(chute_id, accepted)? {
             return Ok(selected);
         }
-        let discovery = self.fetch_instances(chute_id, api_key).await?;
-        self.cache_verified_chutes_nonces(chute_id, discovery, accepted)?;
+        self.discover_verified_nonces(chute_id, api_key, accepted)
+            .await?;
         self.pop_verified_chutes_nonce(chute_id, accepted)?
             .ok_or_else(|| {
                 UpstreamError::ChannelBindingMismatch(
                     "Chutes did not return an E2EE key matching the verified binding".to_string(),
                 )
             })
+    }
+
+    /// Fetch nonces for verified instances, asking discovery again (up to
+    /// [`CHUTES_DISCOVERY_ATTEMPTS`] calls) while it returns only instances
+    /// outside the verified set. Returns the number of nonces cached.
+    async fn discover_verified_nonces(
+        &self,
+        chute_id: &str,
+        api_key: &str,
+        accepted: &[ChutesAcceptedBinding],
+    ) -> Result<usize, UpstreamError> {
+        let mut attempt = 0;
+        loop {
+            attempt += 1;
+            let discovery = self.fetch_instances(chute_id, api_key).await?;
+            match self.cache_verified_chutes_nonces(chute_id, discovery, accepted) {
+                Err(UpstreamError::ChannelBindingMismatch(_))
+                    if attempt < CHUTES_DISCOVERY_ATTEMPTS =>
+                {
+                    continue
+                }
+                result => return result,
+            }
+        }
     }
 
     fn pop_verified_chutes_nonce(
@@ -314,8 +360,8 @@ impl ChutesProviderBackend {
         let api_key = self.api_key()?;
         let chute_id = self.resolve_chute_id(model, &api_key).await?;
         let accepted = chutes_accepted_bindings(event)?;
-        let discovery = self.fetch_instances(&chute_id, &api_key).await?;
-        self.cache_verified_chutes_nonces(&chute_id, discovery, &accepted)
+        self.discover_verified_nonces(&chute_id, &api_key, &accepted)
+            .await
     }
 
     /// `GET {api_base}/chutes/{chute_id}/evidence?nonce={nonce}` → per-instance

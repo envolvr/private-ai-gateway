@@ -43,7 +43,8 @@ use private_ai_gateway::aci::upstream::{
 };
 use private_ai_gateway::aci::verifier::StaticUpstreamVerifier;
 use private_ai_gateway::aggregator::service::{
-    AciService, AciServiceConfig, FixedClock, InMemoryReceiptStore,
+    AciService, AciServiceConfig, FixedClock, InMemoryReceiptStore, UpstreamVerificationRequest,
+    UpstreamVerifier,
 };
 use private_ai_gateway::aggregator::upstream_config::{
     UpstreamConfig, UpstreamConfigManager, UpstreamProvider, UpstreamRuntimeOptions,
@@ -207,6 +208,12 @@ struct ChutesProviderState {
     instance_requests: Arc<Mutex<Vec<String>>>,
     instances: Arc<Vec<ChutesFixtureInstance>>,
     lookup_name: String,
+    /// Return one instance per discovery call, in turn, as Chutes returns a
+    /// small random subset of a large fleet.
+    rotate_discovery: bool,
+    /// Answer this many `/e2e/invoke` calls with 503 before serving, as a
+    /// failing miner instance does.
+    failing_invokes: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 struct ChutesFixtureInstance {
@@ -245,15 +252,17 @@ async fn chutes_instances_handler(
     State(state): State<ChutesProviderState>,
 ) -> impl IntoResponse {
     assert_eq!(chute_id, CHUTES_CHUTE_ID);
-    state
-        .instance_requests
-        .lock()
-        .unwrap()
-        .push(chute_id.clone());
+    let call_index = {
+        let mut requests = state.instance_requests.lock().unwrap();
+        requests.push(chute_id.clone());
+        requests.len() - 1
+    };
     let instances = state
         .instances
         .iter()
-        .map(|instance| {
+        .enumerate()
+        .filter(|(i, _)| !state.rotate_discovery || *i == call_index % state.instances.len())
+        .map(|(_, instance)| {
             json!({
                 "instance_id": instance.instance_id,
                 "e2e_pubkey": instance.e2e_pubkey,
@@ -282,6 +291,34 @@ async fn chutes_invoke_handler(
         .find(|candidate| candidate.instance_id == instance_id)
         .expect("fixture must receive a known Chutes instance id");
     let decrypted = decrypt_chutes_request_blob(&body, &instance.e2e_secret_key);
+    if state
+        .failing_invokes
+        .fetch_update(
+            std::sync::atomic::Ordering::SeqCst,
+            std::sync::atomic::Ordering::SeqCst,
+            |n| n.checked_sub(1),
+        )
+        .is_ok()
+    {
+        state.calls.lock().unwrap().push(ProviderCall {
+            path: "/e2e/invoke (503)".to_string(),
+            authorization: None,
+            accept: None,
+            content_type: None,
+            x_chute_id: None,
+            x_instance_id: Some(instance_id.to_string()),
+            x_e2e_nonce: None,
+            x_e2e_stream: None,
+            x_e2e_path: None,
+            body: Vec::new(),
+            decrypted_body: None,
+        });
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            [("content-type", "application/octet-stream")],
+            Vec::new(),
+        );
+    }
     state.calls.lock().unwrap().push(ProviderCall {
         path: "/e2e/invoke".to_string(),
         authorization: headers
@@ -382,6 +419,33 @@ async fn serve_chutes_provider_fixture_with_instances_and_lookup(
     BTreeMap<String, String>,
     Arc<Mutex<Vec<String>>>,
 ) {
+    serve_chutes_provider_fixture_with_options(instance_defs, lookup_name, false).await
+}
+
+async fn serve_chutes_provider_fixture_with_options(
+    instance_defs: Vec<(&'static str, Vec<&'static str>)>,
+    lookup_name: &str,
+    rotate_discovery: bool,
+) -> (
+    String,
+    Arc<Mutex<Vec<ProviderCall>>>,
+    BTreeMap<String, String>,
+    Arc<Mutex<Vec<String>>>,
+) {
+    serve_chutes_provider_fixture_full(instance_defs, lookup_name, rotate_discovery, 0).await
+}
+
+async fn serve_chutes_provider_fixture_full(
+    instance_defs: Vec<(&'static str, Vec<&'static str>)>,
+    lookup_name: &str,
+    rotate_discovery: bool,
+    failing_invokes: usize,
+) -> (
+    String,
+    Arc<Mutex<Vec<ProviderCall>>>,
+    BTreeMap<String, String>,
+    Arc<Mutex<Vec<String>>>,
+) {
     let calls = Arc::new(Mutex::new(Vec::new()));
     let instance_requests = Arc::new(Mutex::new(Vec::new()));
     let mut e2e_pubkeys = BTreeMap::new();
@@ -409,6 +473,8 @@ async fn serve_chutes_provider_fixture_with_instances_and_lookup(
             instance_requests: instance_requests.clone(),
             instances: Arc::new(instances),
             lookup_name: lookup_name.to_string(),
+            rotate_discovery,
+            failing_invokes: Arc::new(std::sync::atomic::AtomicUsize::new(failing_invokes)),
         });
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -1301,6 +1367,152 @@ async fn chutes_provider_refreshes_verified_nonce_pool_without_forwarding() {
     let calls = provider_calls.lock().unwrap();
     assert_eq!(calls.len(), 1);
     assert_eq!(calls[0].x_e2e_nonce.as_deref(), Some(CHUTES_NONCE));
+}
+
+/// Counts verifications, so a test can tell a cheap retry from a full
+/// re-verification (for Chutes, a rate-limited evidence fetch).
+struct CountingVerifier {
+    inner: StaticUpstreamVerifier,
+    calls: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+#[async_trait::async_trait]
+impl UpstreamVerifier for CountingVerifier {
+    async fn verify(&self, request: UpstreamVerificationRequest) -> UpstreamVerifiedEvent {
+        self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.inner.verify(request).await
+    }
+}
+
+#[tokio::test]
+async fn chutes_provider_retries_discovery_until_a_verified_instance_appears() {
+    // Discovery returns a small subset of a large fleet, so the first call can
+    // return only instances outside the verified set. The backend asks again
+    // (discovery is cheap) instead of failing the request.
+    let (base_url, provider_calls, e2e_pubkeys, instance_requests) =
+        serve_chutes_provider_fixture_with_options(
+            vec![
+                (CHUTES_INSTANCE_ID, vec![CHUTES_NONCE]),
+                (CHUTES_INSTANCE_ID_B, vec![CHUTES_INSTANCE_B_NONCE]),
+            ],
+            "provider-model",
+            true,
+        )
+        .await;
+    let backend = ChutesProviderBackend::new_with_timeouts(base_url.clone(), 10, 600)
+        .unwrap()
+        .with_name("chutes-provider")
+        .with_bearer_token("chutes-secret")
+        .with_e2ee_api_base(base_url.clone());
+    let verifications = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let verifier = CountingVerifier {
+        inner: StaticUpstreamVerifier::new(UpstreamVerifiedEvent {
+            url_origin: Some(base_url),
+            verifier_id: "fixture-chutes-verifier/v1".to_string(),
+            evidence: Some(provider_evidence_fixture("chutes-attestation")),
+            channel_bindings: vec![chutes_key_binding_for(
+                CHUTES_INSTANCE_ID_B,
+                e2e_pubkeys.get(CHUTES_INSTANCE_ID_B).unwrap(),
+            )],
+            ..verified_event("chutes-provider", "provider-model")
+        }),
+        calls: verifications.clone(),
+    };
+    let service = Arc::new(
+        AciService::new_with_upstream_verifier(
+            Arc::new(StaticKeyProvider::default()),
+            Arc::new(StubQuoter::default()),
+            Arc::new(backend),
+            Arc::new(verifier),
+            Arc::new(InMemoryReceiptStore::default()),
+            AciServiceConfig::for_test(),
+            Arc::new(FixedClock(1_700_000_000)),
+        )
+        .unwrap(),
+    );
+    let app = build_router(service);
+
+    let (status, _, body) = call(app, "POST", "/v1/chat/completions", PROVIDER_CHAT_REQUEST).await;
+    assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+
+    assert_eq!(instance_requests.lock().unwrap().len(), 2);
+    assert_eq!(
+        verifications.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "a discovery miss must not trigger a re-verification"
+    );
+    let calls = provider_calls.lock().unwrap();
+    assert_eq!(calls.len(), 1);
+    assert_eq!(
+        calls[0].x_instance_id.as_deref(),
+        Some(CHUTES_INSTANCE_ID_B)
+    );
+    assert_eq!(
+        calls[0].x_e2e_nonce.as_deref(),
+        Some(CHUTES_INSTANCE_B_NONCE)
+    );
+}
+
+#[tokio::test]
+async fn chutes_provider_retries_a_failing_instance_on_another() {
+    // A miner instance that answers 5xx before any response is read gets one
+    // retry on the next verified instance.
+    let (base_url, provider_calls, e2e_pubkeys, _) = serve_chutes_provider_fixture_full(
+        vec![
+            (CHUTES_INSTANCE_ID, vec![CHUTES_NONCE, CHUTES_NONCE_B]),
+            (
+                CHUTES_INSTANCE_ID_B,
+                vec![CHUTES_INSTANCE_B_NONCE, CHUTES_INSTANCE_B_NONCE_B],
+            ),
+        ],
+        "provider-model",
+        false,
+        1,
+    )
+    .await;
+    let backend = ChutesProviderBackend::new_with_timeouts(base_url.clone(), 10, 600)
+        .unwrap()
+        .with_name("chutes-provider")
+        .with_bearer_token("chutes-secret")
+        .with_e2ee_api_base(base_url.clone());
+    let verifier = StaticUpstreamVerifier::new(UpstreamVerifiedEvent {
+        url_origin: Some(base_url),
+        verifier_id: "fixture-chutes-verifier/v1".to_string(),
+        evidence: Some(provider_evidence_fixture("chutes-attestation")),
+        channel_bindings: vec![
+            chutes_key_binding_for(
+                CHUTES_INSTANCE_ID,
+                e2e_pubkeys.get(CHUTES_INSTANCE_ID).unwrap(),
+            ),
+            chutes_key_binding_for(
+                CHUTES_INSTANCE_ID_B,
+                e2e_pubkeys.get(CHUTES_INSTANCE_ID_B).unwrap(),
+            ),
+        ],
+        ..verified_event("chutes-provider", "provider-model")
+    });
+    let service = Arc::new(
+        AciService::new_with_upstream_verifier(
+            Arc::new(StaticKeyProvider::default()),
+            Arc::new(StubQuoter::default()),
+            Arc::new(backend),
+            Arc::new(verifier),
+            Arc::new(InMemoryReceiptStore::default()),
+            AciServiceConfig::for_test(),
+            Arc::new(FixedClock(1_700_000_000)),
+        )
+        .unwrap(),
+    );
+    let app = build_router(service);
+
+    let (status, _, body) = call(app, "POST", "/v1/chat/completions", PROVIDER_CHAT_REQUEST).await;
+    assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+
+    let calls = provider_calls.lock().unwrap();
+    assert_eq!(calls.len(), 2);
+    assert_eq!(calls[0].path, "/e2e/invoke (503)");
+    assert_eq!(calls[1].path, "/e2e/invoke");
+    assert_ne!(calls[0].x_instance_id, calls[1].x_instance_id);
 }
 
 #[tokio::test]
