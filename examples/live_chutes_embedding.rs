@@ -115,6 +115,7 @@ async fn run() -> Result<(), String> {
             public_key_sha256: pubkey_sha256,
         }],
         provider_claims: None,
+        instance_evidence: Default::default(),
     };
 
     let backend = ChutesProviderBackend::new_with_timeouts(CHUTES_API_BASE, 10, 120)

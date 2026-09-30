@@ -16,6 +16,7 @@ from .common import (
     evidence_bundle,
     failed,
     is_uuid_like,
+    json_evidence_bundle,
     provider_options,
     raw_http_bundle_evidence,
     raw_http_item,
@@ -507,6 +508,33 @@ async def verify_chutes(request: dict[str, Any]) -> None:
         provider_claims["failed_instance_ids"] = evidence_data["failed_instance_ids"]
     if skipped_without_key:
         provider_claims["attested_instances_without_e2ee_key"] = skipped_without_key
+    # One self-contained evidence document per verified instance: its entry from
+    # the evidence response, verbatim, plus what re-checking needs (the nonce,
+    # its E2EE key, the report_data they must bind, the matched profile). The
+    # gateway attaches it to the session of an instance that serves (§8.2).
+    evidence_by_instance = {
+        item.get("instance_id"): item for item in evidence_items if item.get("instance_id")
+    }
+    instance_evidence = {
+        item["instance_id"]: json_evidence_bundle(
+            {
+                "type": "chutes.instance_evidence.v1",
+                "chute_id": chute_id,
+                "instance_id": item["instance_id"],
+                "nonce": nonce,
+                "e2e_pubkey": pubkeys[item["instance_id"]],
+                "expected_report_data": hashlib.sha256(
+                    (nonce + pubkeys[item["instance_id"]]).encode()
+                ).hexdigest(),
+                "measurement": item["measurement"],
+                "evidence_url": f"{attestation_url}?nonce={nonce}",
+                "evidence": evidence_by_instance[item["instance_id"]],
+            },
+            source_url=f"{attestation_url}?nonce={nonce}",
+        )
+        for item in verified
+        if item["instance_id"] in evidence_by_instance
+    }
     emit(
         {
             "result": "verified",
@@ -531,6 +559,7 @@ async def verify_chutes(request: dict[str, Any]) -> None:
                     if item["instance_id"] in pubkey_items
                 ],
             },
+            "instance_evidence": instance_evidence,
         }
     )
 

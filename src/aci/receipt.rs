@@ -76,6 +76,11 @@ pub struct UpstreamVerifiedEvent {
     pub evidence: Option<Value>,
     pub channel_bindings: Vec<ChannelBinding>,
     pub provider_claims: Option<Value>,
+    /// Per-instance evidence (`{digest, data}`) keyed by instance id, for a
+    /// provider verified as a fleet in one pass (Chutes). The session of the
+    /// instance that serves a request carries its own entry (§8.2), so a relying
+    /// party can re-check that instance without the rest of the fleet.
+    pub instance_evidence: std::collections::BTreeMap<String, Value>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]

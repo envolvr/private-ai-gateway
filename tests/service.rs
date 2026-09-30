@@ -385,6 +385,7 @@ async fn verified_upstream_binding_fails_without_persisted_session() {
             spki_sha256: "aa".repeat(32),
         }],
         provider_claims: None,
+        instance_evidence: Default::default(),
     };
 
     let err = svc

@@ -241,7 +241,10 @@ impl AciService {
         let receipt_id = generate_receipt_id();
         let served_at = self.clock.now_secs();
         let chat_id = extract_chat_id(&response.body);
-        let sealed = self.record_attested_upstream_session(&recorded_event)?;
+        let sealed = self.record_attested_upstream_session(
+            &recorded_event,
+            response.served_instance_id.as_deref(),
+        )?;
         let recorded = cite_served_session(&sealed, response.served_instance_id.as_deref());
         let session_id = recorded.clone();
         let mut builder = self.build_middleware_receipt_prefix(MiddlewareReceiptInputs {
@@ -591,7 +594,10 @@ impl AciService {
                     let upstream_headers = upstream_response.headers;
                     let receipt_id = generate_receipt_id();
                     let served_at = self.clock.now_secs();
-                    let sealed = self.record_attested_upstream_session(&recorded_event)?;
+                    let sealed = self.record_attested_upstream_session(
+                        &recorded_event,
+                        upstream_response.served_instance_id.as_deref(),
+                    )?;
                     let recorded = cite_served_session(
                         &sealed,
                         upstream_response.served_instance_id.as_deref(),

@@ -365,6 +365,7 @@ impl ExternalProviderVerifier {
             evidence: output.evidence.clone(),
             channel_bindings,
             provider_claims: output.provider_claims.clone(),
+            instance_evidence: output.instance_evidence.clone(),
         })
     }
 
@@ -494,6 +495,8 @@ struct ExternalProviderVerifierOutput {
     attested_scope: Option<String>,
     #[serde(default)]
     chutes_session: Option<ChutesVerifiedDiscovery>,
+    #[serde(default)]
+    instance_evidence: std::collections::BTreeMap<String, Value>,
 }
 
 #[derive(Clone, Deserialize)]

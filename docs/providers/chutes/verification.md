@@ -36,6 +36,20 @@ by DCAP. So possession of a decryptable channel under that key implies you are t
 to the attested enclave. The emitted binding is
 `e2ee_public_key_sha256 = SHA256(decoded ML-KEM public key)`.
 
+## Session evidence
+
+Each verified instance gets its own session, content-addressed on that
+instance's claims. The fleet's raw evidence is large (about 250 KB per instance,
+mostly NVIDIA GPU evidence) and changes with every sibling, so sessions do not
+carry it. The instance that serves a request is the exception: its session
+carries a `chutes.instance_evidence.v1` document, which is the instance's entry
+from `/chutes/{chute_id}/evidence` verbatim plus the verification nonce, its
+E2EE public key, the `report_data` those must bind and the matched measurement
+profile. The receipt cites that session, so a relying party can re-check the
+serving instance (quote, binding, GPU evidence) from the session alone (§8.2).
+A request that pins that session id (`provider.aci_session_ids`) matches its
+instance.
+
 ## What a tamper rejects
 
 - Tampered quote → DCAP signature verification fails (confirmed live:

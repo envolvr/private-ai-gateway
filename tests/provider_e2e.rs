@@ -39,7 +39,7 @@ use private_ai_gateway::aci::receipt::{
 };
 use private_ai_gateway::aci::upstream::{
     ChutesProviderBackend, ChutesSessionStore, ChutesVerifiedDiscovery, ChutesVerifiedInstance,
-    OpenAICompatibleBackend, UpstreamRequest,
+    ModelRoute, ModelRouterBackend, OpenAICompatibleBackend, UpstreamRequest,
 };
 use private_ai_gateway::aci::verifier::StaticUpstreamVerifier;
 use private_ai_gateway::aggregator::service::{
@@ -1513,6 +1513,129 @@ async fn chutes_provider_retries_a_failing_instance_on_another() {
     assert_eq!(calls[0].path, "/e2e/invoke (503)");
     assert_eq!(calls[1].path, "/e2e/invoke");
     assert_ne!(calls[0].x_instance_id, calls[1].x_instance_id);
+}
+
+fn instance_evidence_doc(instance_id: &str) -> Value {
+    let bytes = serde_json::to_vec(&json!({
+        "type": "chutes.instance_evidence.v1",
+        "instance_id": instance_id,
+        "quote": format!("quote-of-{instance_id}"),
+    }))
+    .unwrap();
+    json!({
+        "digest": sha256_hex(&bytes),
+        "data": format!("data:application/json;base64,{}", BASE64.encode(&bytes)),
+    })
+}
+
+#[tokio::test]
+async fn chutes_serving_instance_session_carries_its_own_evidence() {
+    // §8.2: the session a receipt cites must carry evidence a relying party can
+    // re-check. A Chutes fleet is verified in one pass; the instance that served
+    // carries its own slice, the others stay evidence-free.
+    let (base_url, _, e2e_pubkeys, _) = serve_chutes_provider_fixture_with_instances(vec![
+        (
+            CHUTES_INSTANCE_ID,
+            vec![CHUTES_NONCE, CHUTES_NONCE_B, CHUTES_NONCE_C],
+        ),
+        (
+            CHUTES_INSTANCE_ID_B,
+            vec![CHUTES_INSTANCE_B_NONCE, CHUTES_INSTANCE_B_NONCE_B],
+        ),
+    ])
+    .await;
+    let backend = ChutesProviderBackend::new_with_timeouts(base_url.clone(), 10, 600)
+        .unwrap()
+        .with_name("chutes-provider")
+        .with_bearer_token("chutes-secret")
+        .with_e2ee_api_base(base_url.clone());
+    // A TEE-classified route, so a request that pins a session is eligible.
+    let mut router = ModelRouterBackend::new("router");
+    router
+        .add_route(
+            ModelRoute::new(
+                "provider-model",
+                "provider-model",
+                Arc::new(backend),
+                "chutes-provider:provider-model",
+            )
+            .unwrap()
+            .with_is_tee(Some(true)),
+        )
+        .unwrap();
+    let verifier = StaticUpstreamVerifier::new(UpstreamVerifiedEvent {
+        url_origin: Some(base_url),
+        provider_type: Some("chutes".to_string()),
+        verifier_id: "fixture-chutes-verifier/v1".to_string(),
+        evidence: Some(provider_evidence_fixture("chutes-attestation")),
+        channel_bindings: vec![
+            chutes_key_binding_for(
+                CHUTES_INSTANCE_ID,
+                e2e_pubkeys.get(CHUTES_INSTANCE_ID).unwrap(),
+            ),
+            chutes_key_binding_for(
+                CHUTES_INSTANCE_ID_B,
+                e2e_pubkeys.get(CHUTES_INSTANCE_ID_B).unwrap(),
+            ),
+        ],
+        instance_evidence: [
+            (
+                CHUTES_INSTANCE_ID.to_string(),
+                instance_evidence_doc(CHUTES_INSTANCE_ID),
+            ),
+            (
+                CHUTES_INSTANCE_ID_B.to_string(),
+                instance_evidence_doc(CHUTES_INSTANCE_ID_B),
+            ),
+        ]
+        .into_iter()
+        .collect(),
+        ..verified_event("chutes-provider", "provider-model")
+    });
+    let service = Arc::new(
+        AciService::new_with_upstream_verifier(
+            Arc::new(StaticKeyProvider::default()),
+            Arc::new(StubQuoter::default()),
+            Arc::new(router),
+            Arc::new(verifier),
+            Arc::new(InMemoryReceiptStore::default()),
+            AciServiceConfig::for_test(),
+            Arc::new(FixedClock(1_700_000_000)),
+        )
+        .unwrap(),
+    );
+    let app = build_router(service.clone());
+
+    let (status, headers, body) = call(
+        app.clone(),
+        "POST",
+        "/v1/chat/completions",
+        PROVIDER_CHAT_REQUEST,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+    let receipt_id = headers
+        .get("x-receipt-id")
+        .and_then(|value| value.to_str().ok())
+        .unwrap();
+    let receipt = service.get_receipt_by_receipt_id(receipt_id).unwrap();
+    let session_id = receipt_event(&receipt, EVENT_UPSTREAM_VERIFIED)["session_id"]
+        .as_str()
+        .expect("a Chutes receipt cites the serving instance's session")
+        .to_string();
+    let session = service.get_attested_session(&session_id).unwrap();
+    let evidence = &session.document().evidence;
+    let expected = instance_evidence_doc(CHUTES_INSTANCE_ID);
+    assert_eq!(evidence.digest.as_deref(), expected["digest"].as_str());
+    assert_eq!(evidence.data_uri.as_deref(), expected["data"].as_str());
+    assert!(evidence.digest_matches_data());
+
+    // A caller may pin the session its receipt cited.
+    let pinned = format!(
+        r#"{{"model":"provider-model","messages":[{{"role":"user","content":"hello"}}],"provider":{{"aci_session_ids":["{session_id}"]}}}}"#
+    );
+    let (status, _, body) = call(app, "POST", "/v1/chat/completions", pinned).await;
+    assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
 }
 
 #[tokio::test]

@@ -7,7 +7,7 @@ use crate::aggregator::upstream_config::UpstreamSessionSink;
 
 impl UpstreamSessionSink for AciService {
     fn record_session(&self, event: &UpstreamVerifiedEvent) {
-        if let Err(err) = self.record_attested_upstream_session(event) {
+        if let Err(err) = self.record_attested_upstream_session(event, None) {
             tracing::warn!(error = %err, "failed to record attested session from verification");
         }
     }

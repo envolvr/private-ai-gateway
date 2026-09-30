@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use serde::Serialize;
 use serde_json::Value;
@@ -277,7 +277,10 @@ impl AciService {
         }
         builder.add_request_forwarded(&forwarded_body)?;
         if !self.serves_directly() {
-            let sealed = self.record_attested_upstream_session(&recorded_event)?;
+            let sealed = self.record_attested_upstream_session(
+                &recorded_event,
+                upstream_response.served_instance_id.as_deref(),
+            )?;
             // When the backend fronts several instances (Chutes), cite the
             // session of the instance that actually served this request.
             let recorded =
@@ -438,7 +441,10 @@ impl AciService {
         }
         builder.add_request_forwarded(&forwarded_body)?;
         if !self.serves_directly() {
-            let sealed = self.record_attested_upstream_session(&recorded_event)?;
+            let sealed = self.record_attested_upstream_session(
+                &recorded_event,
+                upstream_response.served_instance_id.as_deref(),
+            )?;
             // When the backend fronts several instances (Chutes), cite the
             // session of the instance that actually served this request.
             let recorded =
@@ -676,9 +682,13 @@ impl AciService {
     /// return them. A single-TEE provider yields one; Chutes yields one per
     /// instance. The receipt cites one of these (see [`cite_served_session`]);
     /// each persisted session also carries the evidence + reasons (deep audit).
+    /// `served_instance_id` names the instance that served the response, if
+    /// the backend reports one: its session carries that instance's own
+    /// evidence, so the cited session can be re-checked (§8.2).
     pub(super) fn record_attested_upstream_session(
         &self,
         event: &UpstreamVerifiedEvent,
+        served_instance_id: Option<&str>,
     ) -> Result<Vec<SealedSession>, ServiceError> {
         // §4.1: a direct service has no upstream hop and publishes no
         // attested sessions — this also covers the middleware commit paths
@@ -756,11 +766,22 @@ impl AciService {
                 Some(instance_id) => per_instance_session_claims(event, instance_id),
                 None => session_claims_for_event(event),
             };
-            // A per-instance (Chutes) binding excludes the shared, nonce-bound raw
-            // evidence so re-verifying the same instance is a no-op; a single
-            // channel keeps the event's evidence.
-            let evidence = if instance.is_some() {
-                EvidenceRef::default()
+            // A per-instance (Chutes) binding excludes the shared, nonce-bound
+            // fleet evidence, which is large and changes with every sibling. The
+            // instance that served carries its own evidence (its quote, GPU
+            // evidence, the verification nonce and its E2EE key) so the session
+            // a receipt cites can be re-checked; the others stay evidence-free.
+            // A single channel keeps the event's evidence.
+            let evidence = if let Some(instance_id) = instance {
+                if served_instance_id == Some(instance_id) {
+                    event
+                        .instance_evidence
+                        .get(instance_id)
+                        .map(EvidenceRef::from_value)
+                        .unwrap_or_default()
+                } else {
+                    EvidenceRef::default()
+                }
             } else {
                 event
                     .evidence
@@ -843,7 +864,10 @@ impl AciService {
             ));
         }
 
-        let sealed = self.record_attested_upstream_session(event)?;
+        let sealed = self.record_attested_upstream_session(event, None)?;
+        // A Chutes receipt cites the serving instance's evidence-bearing
+        // session, so a pin on that id must match its instance too.
+        let with_evidence = self.instance_sessions_with_evidence(event);
         let allowed_ids: HashSet<&str> = allowed_ids.iter().map(String::as_str).collect();
         let allowed_bindings: Vec<ChannelBinding> = event
             .channel_bindings
@@ -851,9 +875,13 @@ impl AciService {
             .cloned()
             .zip(sealed)
             .filter_map(|(binding, session)| {
-                allowed_ids
-                    .contains(session.session_id.as_str())
-                    .then_some(binding)
+                let pinned = allowed_ids.contains(session.session_id.as_str())
+                    || session
+                        .instance_key
+                        .as_ref()
+                        .and_then(|instance| with_evidence.get(instance))
+                        .is_some_and(|id| allowed_ids.contains(id.as_str()));
+                pinned.then_some(binding)
             })
             .collect();
 
@@ -864,6 +892,49 @@ impl AciService {
         }
         event.channel_bindings = allowed_bindings;
         Ok(())
+    }
+
+    /// The live evidence-bearing session of each Chutes instance that has one,
+    /// by instance id. Looks up only: an instance gets such a session when it
+    /// serves a request (see [`Self::record_attested_upstream_session`]).
+    fn instance_sessions_with_evidence(
+        &self,
+        event: &UpstreamVerifiedEvent,
+    ) -> HashMap<String, String> {
+        let now = self.clock.now_secs();
+        let retention_until = now.saturating_add(self.config.receipt_ttl_seconds);
+        let identity = Self::identity_from_provider_claims(event.provider_claims.as_ref());
+        let mut sessions = HashMap::new();
+        for binding in &event.channel_bindings {
+            let Some(instance_id) = chutes_instance_id(event, binding) else {
+                continue;
+            };
+            let Some(evidence) = event.instance_evidence.get(instance_id) else {
+                continue;
+            };
+            let evidence = EvidenceRef::from_value(evidence);
+            let claims = per_instance_session_claims(event, instance_id);
+            let channel_binding = vec![binding.clone()];
+            let Ok(fingerprint) = (ChannelMaterial {
+                upstream_name: &event.upstream_name,
+                endpoint: &event.url_origin,
+                verifier_id: &event.verifier_id,
+                identity: &identity,
+                channel_binding: &channel_binding,
+                claims: &claims,
+                evidence_digest: &evidence.digest,
+            })
+            .fingerprint() else {
+                continue;
+            };
+            if let Some(session) =
+                self.session_store
+                    .current_session(&fingerprint, retention_until, now)
+            {
+                sessions.insert(instance_id.to_string(), session.session_id().to_string());
+            }
+        }
+        sessions
     }
 
     /// Return the channel's current session id, sealing (serializing once) and
