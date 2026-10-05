@@ -1,0 +1,6 @@
+# The exact toolchain the production build uses, so a boot never compiles with
+# whatever "stable" happens to be that day (rustup installs this version when a
+# cargo or rustc command runs here). Bump it deliberately.
+[toolchain]
+channel = "1.99.0"
+profile = "minimal"
