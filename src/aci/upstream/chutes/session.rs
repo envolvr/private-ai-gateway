@@ -111,6 +111,19 @@ impl ChutesSessionStore {
         Ok(selected)
     }
 
+    /// Drop every pooled nonce of one instance, which Chutes no longer serves
+    /// (replaced or scaled down), so the next pop selects another verified
+    /// instance. Returns how many nonces were dropped.
+    pub(super) fn evict_instance(&self, chute_id: &str, instance_id: &str) -> usize {
+        let mut cache = self.cache.lock().unwrap();
+        let Some(pool) = cache.nonce_pools.get_mut(chute_id) else {
+            return 0;
+        };
+        let before = pool.len();
+        pool.retain(|nonce| nonce.instance_id != instance_id);
+        before - pool.len()
+    }
+
     fn record_nonce_candidates(
         &self,
         chute_id: &str,

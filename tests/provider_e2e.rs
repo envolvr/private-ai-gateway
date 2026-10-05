@@ -211,9 +211,10 @@ struct ChutesProviderState {
     /// Return one instance per discovery call, in turn, as Chutes returns a
     /// small random subset of a large fleet.
     rotate_discovery: bool,
-    /// Answer this many `/e2e/invoke` calls with 503 before serving, as a
-    /// failing miner instance does.
+    /// Answer this many `/e2e/invoke` calls with `failing_status` before
+    /// serving, as a failing (503) or vanished (404) miner instance does.
     failing_invokes: Arc<std::sync::atomic::AtomicUsize>,
+    failing_status: StatusCode,
 }
 
 struct ChutesFixtureInstance {
@@ -301,7 +302,7 @@ async fn chutes_invoke_handler(
         .is_ok()
     {
         state.calls.lock().unwrap().push(ProviderCall {
-            path: "/e2e/invoke (503)".to_string(),
+            path: format!("/e2e/invoke ({})", state.failing_status.as_u16()),
             authorization: None,
             accept: None,
             content_type: None,
@@ -314,7 +315,7 @@ async fn chutes_invoke_handler(
             decrypted_body: None,
         });
         return (
-            StatusCode::SERVICE_UNAVAILABLE,
+            state.failing_status,
             [("content-type", "application/octet-stream")],
             Vec::new(),
         );
@@ -432,7 +433,14 @@ async fn serve_chutes_provider_fixture_with_options(
     BTreeMap<String, String>,
     Arc<Mutex<Vec<String>>>,
 ) {
-    serve_chutes_provider_fixture_full(instance_defs, lookup_name, rotate_discovery, 0).await
+    serve_chutes_provider_fixture_full(
+        instance_defs,
+        lookup_name,
+        rotate_discovery,
+        0,
+        StatusCode::SERVICE_UNAVAILABLE,
+    )
+    .await
 }
 
 async fn serve_chutes_provider_fixture_full(
@@ -440,6 +448,7 @@ async fn serve_chutes_provider_fixture_full(
     lookup_name: &str,
     rotate_discovery: bool,
     failing_invokes: usize,
+    failing_status: StatusCode,
 ) -> (
     String,
     Arc<Mutex<Vec<ProviderCall>>>,
@@ -475,6 +484,7 @@ async fn serve_chutes_provider_fixture_full(
             lookup_name: lookup_name.to_string(),
             rotate_discovery,
             failing_invokes: Arc::new(std::sync::atomic::AtomicUsize::new(failing_invokes)),
+            failing_status,
         });
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -1468,6 +1478,7 @@ async fn chutes_provider_retries_a_failing_instance_on_another() {
         "provider-model",
         false,
         1,
+        StatusCode::SERVICE_UNAVAILABLE,
     )
     .await;
     let backend = ChutesProviderBackend::new_with_timeouts(base_url.clone(), 10, 600)
@@ -1513,6 +1524,76 @@ async fn chutes_provider_retries_a_failing_instance_on_another() {
     assert_eq!(calls[0].path, "/e2e/invoke (503)");
     assert_eq!(calls[1].path, "/e2e/invoke");
     assert_ne!(calls[0].x_instance_id, calls[1].x_instance_id);
+}
+
+#[tokio::test]
+async fn chutes_provider_drops_a_vanished_instance_and_retries_on_another() {
+    // Chutes answers 404 for an instance it no longer serves. The request is
+    // retried on the next verified instance, and the vanished instance's other
+    // pooled nonces are dropped, so the next request does not try it again.
+    let (base_url, provider_calls, e2e_pubkeys, _) = serve_chutes_provider_fixture_full(
+        vec![
+            (CHUTES_INSTANCE_ID, vec![CHUTES_NONCE, CHUTES_NONCE_B]),
+            (
+                CHUTES_INSTANCE_ID_B,
+                vec![CHUTES_INSTANCE_B_NONCE, CHUTES_INSTANCE_B_NONCE_B],
+            ),
+        ],
+        "provider-model",
+        false,
+        1,
+        StatusCode::NOT_FOUND,
+    )
+    .await;
+    let backend = ChutesProviderBackend::new_with_timeouts(base_url.clone(), 10, 600)
+        .unwrap()
+        .with_name("chutes-provider")
+        .with_bearer_token("chutes-secret")
+        .with_e2ee_api_base(base_url.clone());
+    let verifier = StaticUpstreamVerifier::new(UpstreamVerifiedEvent {
+        url_origin: Some(base_url),
+        verifier_id: "fixture-chutes-verifier/v1".to_string(),
+        evidence: Some(provider_evidence_fixture("chutes-attestation")),
+        channel_bindings: vec![
+            chutes_key_binding_for(
+                CHUTES_INSTANCE_ID,
+                e2e_pubkeys.get(CHUTES_INSTANCE_ID).unwrap(),
+            ),
+            chutes_key_binding_for(
+                CHUTES_INSTANCE_ID_B,
+                e2e_pubkeys.get(CHUTES_INSTANCE_ID_B).unwrap(),
+            ),
+        ],
+        ..verified_event("chutes-provider", "provider-model")
+    });
+    let service = Arc::new(
+        AciService::new_with_upstream_verifier(
+            Arc::new(StaticKeyProvider::default()),
+            Arc::new(StubQuoter::default()),
+            Arc::new(backend),
+            Arc::new(verifier),
+            Arc::new(InMemoryReceiptStore::default()),
+            AciServiceConfig::for_test(),
+            Arc::new(FixedClock(1_700_000_000)),
+        )
+        .unwrap(),
+    );
+    let app = build_router(service);
+
+    for _ in 0..2 {
+        let (status, _, body) =
+            call(app.clone(), "POST", "/v1/chat/completions", PROVIDER_CHAT_REQUEST).await;
+        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+    }
+
+    let calls = provider_calls.lock().unwrap();
+    assert_eq!(calls.len(), 3);
+    assert_eq!(calls[0].path, "/e2e/invoke (404)");
+    assert_eq!(calls[0].x_instance_id.as_deref(), Some(CHUTES_INSTANCE_ID));
+    for call in &calls[1..] {
+        assert_eq!(call.path, "/e2e/invoke");
+        assert_eq!(call.x_instance_id.as_deref(), Some(CHUTES_INSTANCE_ID_B));
+    }
 }
 
 fn instance_evidence_doc(instance_id: &str) -> Value {

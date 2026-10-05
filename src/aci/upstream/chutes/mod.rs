@@ -209,6 +209,22 @@ impl ChutesProviderBackend {
             if retry_allowed && matches!(status_code, 500 | 502 | 503 | 504) {
                 continue;
             }
+            // Chutes answers 404 for an instance it no longer serves (replaced
+            // or scaled down). Every pooled nonce of that instance would fail the
+            // same way until the next refresh, so drop them and retry on another
+            // verified instance.
+            if retry_allowed && status_code == 404 {
+                let dropped = self
+                    .session_store
+                    .evict_instance(&chute_id, &selected.instance_id);
+                tracing::warn!(
+                    chute_id = %chute_id,
+                    instance_id = %selected.instance_id,
+                    dropped,
+                    "Chutes instance answered 404; dropped its sessions, retrying on another verified instance"
+                );
+                continue;
+            }
             let headers = response_headers(&resp);
             return Ok(ChutesInvokeResponse {
                 status_code,
