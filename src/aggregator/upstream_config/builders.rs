@@ -119,8 +119,12 @@ fn build_provider_backend(
             if let Some(token) = &cfg.bearer_token {
                 inner = inner.with_bearer_token(token.clone());
             }
-            let backend = NearAiBackend::new(inner, cfg.base_url.clone(), cfg.bearer_token.clone())
-                .map_err(|e| UpstreamConfigError::InvalidConfig(e.to_string()))?;
+            let mut backend =
+                NearAiBackend::new(inner, cfg.base_url.clone(), cfg.bearer_token.clone())
+                    .map_err(|e| UpstreamConfigError::InvalidConfig(e.to_string()))?;
+            if cfg.near_router_only {
+                backend = backend.router_only();
+            }
             Ok(Arc::new(backend))
         }
         UpstreamProvider::OpenAiCompatible
@@ -269,6 +273,9 @@ fn build_provider_verifier(
                     NearAiProviderVerifier::new_with_cache(request_timeout_seconds, cache_seconds);
                 if let Some(token) = &cfg.bearer_token {
                     verifier = verifier.with_api_key(token.clone());
+                }
+                if cfg.near_router_only {
+                    verifier = verifier.router_only();
                 }
                 Some(Arc::new(verifier))
             }

@@ -218,6 +218,13 @@ impl NearAiProviderVerifier {
         self
     }
 
+    /// Verify NEAR's gateway (router) enclave alone: for models NEAR serves
+    /// outside a TEE, whose model-scoped report NEAR refuses.
+    pub fn router_only(mut self) -> Self {
+        self.verifier = self.verifier.with_option("near_ai_scope", "router");
+        self
+    }
+
     #[cfg(test)]
     pub(super) fn with_command(
         command: Vec<String>,

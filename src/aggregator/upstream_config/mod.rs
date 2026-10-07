@@ -83,6 +83,12 @@ pub struct UpstreamConfig {
     pub chutes_e2ee_discovery_rounds: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub chutes_e2ee_discovery_interval_seconds: Option<u64>,
+    /// NEAR AI only: verify NEAR's gateway (router) enclave alone, for models
+    /// NEAR serves outside a TEE (its incognito models, relayed to a partner
+    /// provider). Receipts bind to the router session and record that no model
+    /// enclave served the response.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub near_router_only: bool,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -123,6 +129,8 @@ pub struct PublicUpstreamConfig {
     pub chutes_e2ee_discovery_rounds: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub chutes_e2ee_discovery_interval_seconds: Option<u64>,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub near_router_only: bool,
 }
 
 impl UpstreamConfig {
@@ -149,6 +157,7 @@ impl UpstreamConfig {
             chutes_chute_ids: self.chutes_chute_ids.clone(),
             chutes_e2ee_discovery_rounds: self.chutes_e2ee_discovery_rounds,
             chutes_e2ee_discovery_interval_seconds: self.chutes_e2ee_discovery_interval_seconds,
+            near_router_only: self.near_router_only,
         }
     }
 }

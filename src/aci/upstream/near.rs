@@ -15,6 +15,11 @@
 //! Streaming responses, and responses NEAR's gateway re-signs because it changed
 //! the relayed bytes (`gateway` signatures: aliasing, the Responses API), stay
 //! bound to the router session. The receipt records the outcome either way.
+//!
+//! A router-only backend serves models NEAR runs outside a TEE (its incognito
+//! models, relayed to a partner provider under shared credentials): no enclave
+//! signature exists, so none is fetched, and every response stays bound to the
+//! router session with that recorded.
 
 use std::time::Duration;
 
@@ -127,7 +132,12 @@ pub struct NearAiBackend {
     base_url: String,
     bearer_token: Option<String>,
     client: reqwest::Client,
+    router_only: bool,
 }
+
+/// Why a router-only response has no enclave binding, as the receipt states it.
+pub const ROUTER_ONLY_REASON: &str = "relay: NEAR serves this model outside a TEE (incognito, on a \
+     partner provider); the response is bound to NEAR's attested gateway, not to a model enclave";
 
 impl NearAiBackend {
     pub fn new(
@@ -144,7 +154,14 @@ impl NearAiBackend {
             base_url: base_url.into().trim_end_matches('/').to_string(),
             bearer_token,
             client,
+            router_only: false,
         })
+    }
+
+    /// Serve models NEAR runs outside a TEE: skip the enclave signature lookup.
+    pub fn router_only(mut self) -> Self {
+        self.router_only = true;
+        self
     }
 
     /// NEAR signs with the serving enclave only when the relayed bytes are the
@@ -212,7 +229,16 @@ impl NearAiBackend {
         if !(200..300).contains(&response.status_code) {
             return response;
         }
-        let parsed: Option<Value> = serde_json::from_slice(&response.body).ok();
+        if self.router_only {
+            let mut fields = Map::new();
+            fields.insert("provider".to_string(), Value::String("near-ai".to_string()));
+            fields.insert("bound".to_string(), Value::Bool(false));
+            fields.insert("scope".to_string(), Value::String("router".to_string()));
+            fields.insert("reason".to_string(), Value::String(ROUTER_ONLY_REASON.to_string()));
+            response.response_attestation = Some(fields);
+            return response;
+        }
+                let parsed: Option<Value> = serde_json::from_slice(&response.body).ok();
         let chat_id = parsed
             .as_ref()
             .and_then(|v| v.get("id"))
@@ -473,6 +499,29 @@ mod tests {
                 .unwrap_err()
                 .contains("does not match")
         );
+    }
+
+    #[tokio::test]
+    async fn router_only_records_the_relay_without_fetching_a_signature() {
+        // The base URL is unroutable: any signature fetch would fail with a
+        // transport error instead of the relay reason.
+        let inner = OpenAICompatibleBackend::new("http://127.0.0.1:9").unwrap();
+        let backend = NearAiBackend::new(inner, "http://127.0.0.1:9", None)
+            .unwrap()
+            .router_only();
+        let response = UpstreamResponse {
+            status_code: 200,
+            body: br#"{"id":"chatcmpl-1","choices":[]}"#.to_vec(),
+            ..UpstreamResponse::default()
+        };
+        let out = backend
+            .attest_response(br#"{"model":"anthropic/claude-sonnet-5-5"}"#, response)
+            .await;
+        let fields = out.response_attestation.expect("the outcome is recorded");
+        assert_eq!(fields["bound"], Value::Bool(false));
+        assert_eq!(fields["scope"], Value::String("router".to_string()));
+        assert_eq!(fields["reason"], Value::String(ROUTER_ONLY_REASON.to_string()));
+        assert!(out.served_instance_id.is_none());
     }
 
     #[test]

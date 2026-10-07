@@ -16,6 +16,12 @@ responses from the serving enclave (`provider_tee` signatures over
 `<model>:<sha256(request)>:<sha256(response)>`), so the backend can bind each
 response to one verified enclave and cite that enclave's own session. With no
 verified model enclave, the result falls back to the router scope.
+
+Router-only upstreams (`near_ai_scope: router`) serve models NEAR runs outside a
+TEE (its incognito models, relayed to a partner provider under shared
+credentials). NEAR refuses a model-scoped report for them, so the report is
+fetched without a model: only the gateway layer is verified, and the claims say
+the model is relayed, not attested.
 """
 
 from __future__ import annotations
@@ -44,11 +50,11 @@ FETCH_ATTEMPTS = 5
 FETCH_TIMEOUT = (15, 60)
 
 
-def fetch_report(model_id: str, api_key: str | None, nonce: str) -> dict[str, Any]:
+def fetch_report(model_id: str | None, api_key: str | None, nonce: str) -> dict[str, Any]:
     import requests
 
     params = {
-        "model": model_id,
+        **({"model": model_id} if model_id else {}),
         "signing_algo": "ecdsa",
         "nonce": nonce,
         "include_tls_fingerprint": "true",
@@ -136,20 +142,22 @@ async def verify_nearai(request: dict[str, Any]) -> None:
             return
 
     model_id = request["model_id"]
-    api_key = (request.get("provider_options") or {}).get("near_ai_api_key")
+    options = request.get("provider_options") or {}
+    api_key = options.get("near_ai_api_key")
+    router_only = options.get("near_ai_scope") == "router"
     nonce = secrets.token_hex(32)
     dstack_verifier_url = os.getenv("DSTACK_VERIFIER_URL", "http://localhost:8080")
     # The verifier library prints progress to stdout, which carries this bridge's
     # JSON result, so its output is redirected; results are emitted after the block.
     try:
-        raw = await asyncio.to_thread(fetch_report, model_id, api_key, nonce)
+        raw = await asyncio.to_thread(fetch_report, None if router_only else model_id, api_key, nonce)
     except RuntimeError as exc:
         failed(provider, str(exc), verifier_id=verifier_id)
         return
     with contextlib.redirect_stdout(sys.stderr):
         verifier = NearAICloudVerifier(dstack_verifier_url)
         gateway_result = await verifier.verify_gateway_component(raw, nonce)
-        entries = [
+        entries = [] if router_only else [
             entry
             for entry in raw.get("model_attestations") or []
             if entry.get("model_name") in (None, model_id)
@@ -212,6 +220,13 @@ async def verify_nearai(request: dict[str, Any]) -> None:
             "production_os_image": gateway_production_os,
             "model_enclaves_verified": 0,
         }
+        if router_only:
+            provider_claims["model_tee"] = False
+            provider_claims["relay"] = (
+                "NEAR serves this model outside a TEE (incognito): its gateway relays the request "
+                "to a partner provider under shared credentials, and that provider processes it "
+                "under its own terms"
+            )
         if failed_enclaves:
             provider_claims["failed_enclaves"] = failed_enclaves
         emit(

@@ -281,6 +281,12 @@ pub(super) fn validate_config(config: &[UpstreamConfig]) -> Result<(), UpstreamC
                 upstream.name
             )));
         }
+        if upstream.near_router_only && upstream.provider != UpstreamProvider::NearAi {
+            return Err(UpstreamConfigError::InvalidConfig(format!(
+                "upstream {:?} sets near_router_only but provider is not near-ai",
+                upstream.name
+            )));
+        }
         // The native Anthropic API only serves /v1/messages; without an
         // explicit path the router falls back to /v1/chat/completions and
         // every request 404s with no config-time signal.

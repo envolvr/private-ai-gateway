@@ -38,6 +38,7 @@ fn test_upstream_config(
         chutes_chute_ids: None,
         chutes_e2ee_discovery_rounds: None,
         chutes_e2ee_discovery_interval_seconds: None,
+        near_router_only: false,
     }
 }
 
@@ -183,6 +184,42 @@ fn parse_config_allows_same_public_model_on_distinct_route_ids() {
 }
 
 #[test]
+fn parse_config_accepts_near_router_only_for_near_ai_alone() {
+    let configs = parse_config_text(
+        r#"
+            [
+              {
+                "name": "near-incognito",
+                "provider": "near-ai",
+                "base_url": "https://cloud-api.near.ai",
+                "models": {"anthropic/claude-sonnet-5-5": "anthropic/claude-sonnet-5-5"},
+                "near_router_only": true
+              }
+            ]
+            "#,
+    )
+    .expect("near_router_only is valid on a near-ai upstream");
+    assert!(configs[0].near_router_only);
+    assert!(configs[0].redacted().near_router_only);
+
+    let err = parse_config_text(
+        r#"
+            [
+              {
+                "name": "chutes",
+                "provider": "chutes",
+                "base_url": "https://llm.chutes.ai",
+                "models": {"m": "m"},
+                "near_router_only": true
+              }
+            ]
+            "#,
+    )
+    .expect_err("near_router_only must not apply to another provider");
+    assert!(err.to_string().contains("provider is not near-ai"));
+}
+
+#[test]
 fn parse_config_rejects_preverified_provider() {
     let err = parse_config_text(
         r#"
@@ -315,6 +352,7 @@ async fn prewarm_verification_deduplicates_upstream_models() {
         chutes_chute_ids: None,
         chutes_e2ee_discovery_rounds: None,
         chutes_e2ee_discovery_interval_seconds: None,
+        near_router_only: false,
     }];
     let state = Arc::new(RwLock::new(Arc::new(ConfiguredUpstreams {
         config,
